@@ -6,3 +6,8 @@ numpy
 matplotlib
 seaborn
 plotly
+streamlit
+torch
+torchvision
+pillow
+numpy
