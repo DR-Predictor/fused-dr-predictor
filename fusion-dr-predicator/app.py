@@ -5,48 +5,58 @@ from torchvision import models, transforms
 from PIL import Image
 import numpy as np
 
-# Define the model architecture (same as training)
+# Define the model architecture (only fusion parts, NOT feature extractor)
 class FusionModel(nn.Module):
     def __init__(self, num_classes=5, clinical_features=3):
         super(FusionModel, self).__init__()
-        # Load pretrained ResNet50
-        self.resnet = models.resnet50(pretrained=False)
-        # Remove the final classification layer
-        self.resnet = nn.Sequential(*list(self.resnet.children())[:-1])
         
-        # Freeze ResNet layers
-        for param in self.resnet.parameters():
-            param.requires_grad = False
+        # Image branch - Simple linear layer on extracted features
+        # Input: 2048 (pre-extracted ResNet features) -> Output: 256
+        self.image_branch = nn.Sequential(
+            nn.Linear(2048, 256),
+            nn.ReLU()
+        )
         
-        # Fusion layers
-        self.fc1 = nn.Linear(2048 + clinical_features, 512)
-        self.dropout1 = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(512, 256)
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc3 = nn.Linear(256, num_classes)
-        self.relu = nn.ReLU()
+        # Clinical data branch
+        # Input: 3 clinical features -> Output: 32
+        self.clinical_branch = nn.Sequential(
+            nn.Linear(clinical_features, 32),
+            nn.ReLU()
+        )
+        
+        # Fusion layers (256 from image + 32 from clinical = 288 total)
+        self.fusion = nn.Sequential(
+            nn.Linear(288, 128),  # 256 + 32 = 288 inputs
+            nn.ReLU(),
+            nn.Linear(128, num_classes)  # Output 5 classes
+        )
     
-    def forward(self, image, clinical):
-        # Extract image features
-        img_features = self.resnet(image)
-        img_features = img_features.view(img_features.size(0), -1)
+    def forward(self, img_features, clinical):
+        # Process through image branch
+        img_out = self.image_branch(img_features)
         
-        # Concatenate image features with clinical data
-        combined = torch.cat((img_features, clinical), dim=1)
+        # Process clinical data
+        clinical_out = self.clinical_branch(clinical)
         
-        # Pass through fusion layers
-        x = self.relu(self.fc1(combined))
-        x = self.dropout1(x)
-        x = self.relu(self.fc2(x))
-        x = self.dropout2(x)
-        x = self.fc3(x)
+        # Concatenate and fuse
+        combined = torch.cat((img_out, clinical_out), dim=1)  # [batch, 288]
+        output = self.fusion(combined)
         
-        return x
+        return output
 
-# Load model
-model = FusionModel(num_classes=5, clinical_features=3)
-model.load_state_dict(torch.load('fusion_model_mvp.pth', map_location=torch.device('cpu')))
-model.eval()
+# Load the fusion model
+fusion_model = FusionModel(num_classes=5, clinical_features=3)
+fusion_model.load_state_dict(torch.load('fusion_model_mvp.pth', map_location=torch.device('cpu')))
+fusion_model.eval()
+
+# Load ResNet50 feature extractor separately (with pretrained ImageNet weights)
+resnet = models.resnet50(weights='IMAGENET1K_V1')
+feature_extractor = nn.Sequential(*list(resnet.children())[:-1])
+feature_extractor.eval()
+
+# Freeze feature extractor
+for param in feature_extractor.parameters():
+    param.requires_grad = False
 
 # Image preprocessing
 def preprocess_image(image):
@@ -86,12 +96,17 @@ def predict_dr(image, hba1c, blood_pressure, duration):
         # Preprocess image
         img_tensor = preprocess_image(image)
         
+        # Extract features using ResNet50
+        with torch.no_grad():
+            img_features = feature_extractor(img_tensor)
+            img_features = img_features.view(img_features.size(0), -1)  # Flatten to [batch, 2048]
+        
         # Prepare clinical data
         clinical_data = torch.tensor([[hba1c, blood_pressure, duration]], dtype=torch.float32)
         
-        # Make prediction
+        # Make prediction with fusion model
         with torch.no_grad():
-            output = model(img_tensor, clinical_data)
+            output = fusion_model(img_features, clinical_data)
             probabilities = torch.softmax(output, dim=1)
             predicted_class = torch.argmax(probabilities, dim=1).item()
             confidence = probabilities[0][predicted_class].item() * 100
